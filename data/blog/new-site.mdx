@@ -1,0 +1,64 @@
+---
+title: New Site
+date: '2022-04-02'
+tags: ['coding']
+draft: false
+summary: I finally got around to updating my site. Here's how I did it.
+---
+
+# Why I updated
+
+First off, let's start at why I did this in the first place. I'm hate blogging, but as someone who works with web technologies I feel obliged to keep a site going. Not having a site feels a lot like being a mechanic without a car. But my old site was pretty terrible, and has been a bit of an eyesore for a while.
+
+![The Old Site](/static/images/oldsite.jpg 'Never did fix that working title...')
+
+So a little background on that. It was your standard, run of the mill, ghost.js blog. It came with a pretty okay CMS, and some custom templating I used to get that background image in there. I had it hosted on heroku, because it was free and got the job done.
+
+But there were some serious drawbacks with the old site. For starters, pageload was abysmal. This is partially from using heroku and part from including things like the giant, unoptimized splash image on the background of the page. Either way, it'd often take 5 or more seconds to load, plus an additional few seconds for the image to pop in. I felt bad showing it to people, let alone other developers.
+
+# Harder, Better, Faster, Stronger
+
+Let's talk about my new site. First off, full disclosure. This is a fork of the [Tailwind NextJS Starter Blog](https://github.com/timlrx/tailwind-nextjs-starter-blog). Huge shoutout to Timothy Lin, the creator of it. I have nothing but positive things to say about using this, as we'll see below. With that out of the way, let's discuss some of the changes.
+
+# Next Level
+
+The main difference here is that this one's based on Next.js, my new favorite front-end framework. NextJS is great. It takes all the good parts of react, bakes in a bunch of great features like SSR and static HTML generation, and ties it together with a really easy to use routing scheme. As someone who likes a little structure in his life, this feels like a more ergonomic, less clunky alternative to angular. I would use this 10/10 times over pure react, where I'm left to my own devices and terrible organizational sense.
+
+# Bells and Whistles
+
+On top of Next, the site comes baked in with MDX for writing posts, tailwind for styling, RSS generation, and hooks for Gisqus and Disqus comments. And that MDX has a ton of plugins preloaded as well, including support for KaTeX:
+
+$$
+\mathbf{Y} = \left[\begin{array}
+  {c}
+  y_1 \\
+  . \\
+  . \\
+  . \\
+  y_n
+\end{array}\right]
+$$
+
+and beautiful code blocks with syntax highlighting for tons of different languages:
+
+```javascript
+//look at this shit!
+const beautifulSyntax = (high) => 'lighting'
+export default beautifulSyntax
+```
+
+Seriously, this is so nice to work with. I can also natively embed JSX into my posts, which is pretty sweet. But I'm sure you're wondering, how does all of this affect performance?
+
+# Speed
+
+It's also rediculously fast. All the pages can either be rendered client-side, rendered server-side, fully pre-rendered with static site generation, or partially pre-rendered with incremental static regeneration. Moreover, images are dynamically resized by default so that they're served as small as possible over to the client.
+
+# Extensibility
+
+Aside from all the cool things the template provides, the new site's also been a great playground for trying out new features. For instance, I set up the "Stuff" page to dynamically pull and embed all my instagram posts, so that I don't actually have to write stuff to fill it with content. Check back soon for a post on how I did that.
+
+# Conclusion
+
+I think it's fair to say that this has been a pretty big step up from the old site. It's also been a great learning experience, and good way to dip my toe into the world of NextJS. And as always, check the link below for all the sources.
+
+[Blog 2.0](https://github.com/Schnides123/blogv2)

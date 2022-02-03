@@ -1,0 +1,511 @@
+---
+title: Warrdle
+date: '2022-04-02'
+tags: ['coding', 'guide']
+draft: false
+summary: Making a multiplayer wordle clone, step by step.
+---
+
+<div className="-mx-2 flex flex-wrap overflow-hidden xl:-mx-2">
+  <div className="my-1 w-full overflow-hidden px-2 xl:my-1 xl:w-1/2 xl:px-2">
+    ![Logo](/static/images/warrdlelogo.svg)
+  </div>
+</div>
+
+**See it live at [warrdle.com](https://warrdle.com)**
+
+# It's like wordle, but head-to-head
+
+So like a lot of people, I've found myself caught up in the wordle craze. It's simple, fun, and addictive. Eventually, I decided to take a crack at my own version of it, but with one key twist: there's two players, each racing against each other to solve the same word.
+
+# Fun with Websockets
+
+Much like the three-body problem in physics, or a mormon thanksgiving, things get chaotic when you go beyond a single connection. In this case, the state goes from a nice, easy, deterministic flow where the client submits guesses and the server returns results to one where the state is being concurrently updated and juggled between two users. The most obvious issue here, is that the simple request-response flow that would work in OG wordle is no longer sufficient. The server, as the source of truth between all parties, will need to actively send updates to clients whenever the other player sends a guess. HTTP2 doesn't like this all that much, so we'll have to get web sockets involved.
+
+First, we'll set up a basic handler and router to receive our requests and pass them off to be upgraded
+
+```go
+func main() {
+	r := mux.NewRouter()
+	endpoints.SetupRoutes(r)
+	http.ListenAndServe(":42069", r)
+}
+
+func SetupRoutes(r *mux.Router) {
+	r.HandleFunc("/", HomeHandler)
+	r.HandleFunc("/wordle", WordleHandler)
+	r.HandleFunc("/blitz/", MatchmakingHandler)
+	r.HandleFunc("/blitz/challenge", ChallengeLinkHandler)
+	r.HandleFunc("/blitz/{gameID}", BlitzHandler)
+}
+```
+
+This is some pretty basic boilerplate, but it will let us define a couple of different actions for our backend to work with. To get started, we'll look at the `/blitz/{gameID}` endpoint. It's where the main game logic gets set up, and where other endpoints like challenge and matchmaking funnel into after games are set up.
+
+The blitz handler's job is to pull the info we want from the initial request and then, if everything checks out, upgrade it into a websocket connection. Here's the TLDR version of the code:
+
+```go
+func BlitzHandler(w http.ResponseWriter, r *http.Request) {
+
+    params := mux.Vars(r)
+    gameID, _ = params["gameID"]
+
+    // not pictured: a bunch of validation logic
+    . . .
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// upgrader.Upgrade sets HTTP failure status code, so
+		// just need to set response body
+		fmt.Fprint(w, err.Error())
+		fmt.Printf("could not upgrade: %s\n", err.Error())
+		return
+	}
+
+	connection := ws.NewConnection(conn)
+	connection.Start()
+
+	client := ws.NewClient(playerID, connection, game)
+	client.Run()
+}
+```
+
+So when we wrap up the handler logic, our output is really going to be the connection and client objects that we pass our new socket connection into. These client then kicks off its own thread, and then we enter the wonderful, buggy world of concurrent programming.
+
+# Fun with GoRoutines
+
+Yep, this is getting its own section. In a nutshell, each game consists of two client threads fighting over a shared state, and a server that attempts to make everyone play nice with each other. Here's what the client loop looks like.
+
+```go
+func (c *Client) Run() {
+	func() {
+		clientLock.Lock()
+		defer clientLock.Unlock()
+		if _, ok := allClients[c.id]; !ok {
+			allClients[c.id] = make(map[*Client]bool)
+		}
+		allClients[c.id][c] = true
+	}()
+
+	defer func() {
+		clientLock.Lock()
+		defer clientLock.Unlock()
+		delete(allClients[c.id], c)
+	}()
+
+	c.game.AddPlayer(c.id)
+	BroadcastGame(c.game)
+
+	defer func() {
+		c.game.RemovePlayer(c.id)
+		BroadcastGame(c.game)
+	}()
+
+	// Wait for guesses
+	for {
+		select {
+		case msg, ok := <-c.connection.MessageChannel():
+			if !ok {
+				return
+			}
+
+			if len(msg.Guess) != c.game.Word.Length {
+				c.SendError(fmt.Sprintf("guess lengh %v must match length of word %v", len(msg.Guess), c.game.Word.Length))
+				continue
+			}
+
+			if err := c.game.Guess(msg.Guess, msg.Player); err != nil {
+				c.SendError(err.Error())
+				continue
+			}
+
+			data.UpdateGame(c.game)
+
+			BroadcastGame(c.game)
+		case err, ok := <-c.connection.ErrorChannel():
+			if !ok {
+				return
+			}
+
+			c.SendError(err.Error())
+		}
+	}
+}
+```
+
+So what are we looking at here? First off, we're starting with a couple of lock blocks. Because anything and everything can blow up when we have a bunch of clients all hitting the same resources. The first of these, will put the client ID into a set, so we can keep track of our clients. The second block defers removing the client from that set until the game loop has been broken. From ere, we broadcast the current state of the game for our new client. This will get read by our other player and kick off the event loop below.
+
+Speaking of the for loop, this is what we use to handle updates between players. Our events both client and server are broadcast via the MessageChannel, which is a part of this struct:
+
+```go
+type GameConnection struct {
+	connection     *websocket.Conn
+	messageChannel chan R
+	errorChannel   chan *Error
+	writeLock      sync.Mutex
+}
+```
+
+This is the connection we made earlier, and is what wraps our chans, websocket, and mutex together. As we've seen before, the client threads all listen and broadcast to these chans in order to communicate the state of the game. By funneling everything through chans like this, we have essentially made a really janky pub-sub system.
+
+Now going back to this connection for a second, let's see what that `Start()` method we called earlier is doing.
+
+```go
+func (c *GameConnection) Start() {
+	go c.Run()
+}
+
+func (c *GameConnection) Run() {
+	defer c.connection.Close()
+	defer close(c.errorChannel)
+	defer close(c.messageChannel)
+
+	for {
+		var msg R
+		_, r, err := c.connection.NextReader()
+		if err != nil {
+			c.errorChannel <- &Error{
+				Details: err.Error(),
+			}
+			return
+		}
+		err = json.NewDecoder(r).Decode(&msg)
+		if err == io.EOF {
+			// One value is expected in the message.
+			err = io.ErrUnexpectedEOF
+		}
+
+		if err != nil {
+			c.errorChannel <- &Error{
+				Details: fmt.Errorf("failed to parse message: %w", err).Error(),
+			}
+			continue
+		}
+
+		c.messageChannel <- msg
+	}
+}
+```
+
+This is going to sit in its own goroutine and listen for any new messages on the socket. When we receive input from it, we decode it, parse it, and ship it off to its appropriate channel for use by the other threads.
+
+Our last func of interest in the connection class is going to be our write method.
+
+```go
+func (c *GameConnection) Write(msg W) error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	return c.connection.WriteJSON(msg)
+}
+```
+
+This is what we were calling in the client earlier to push our state out to the frontend. Pretty straightforward stuff.
+
+# The Actual Game Logic
+
+So now that we have the logistics out of the way, let's look at the actual game stuff.
+
+```go
+type Game struct {
+	Id      string      `json:"id"`
+	Word    *Word       `json:"word"`
+	Guessed []*Guess    `json:"guessed"`
+	Winner  bool        `json:"winner"`
+	Options GameOptions `json:"options"`
+	Players *util.Set   `json:"players"`
+
+	playersLock sync.Mutex
+}
+```
+
+Here's the basic struct for the game state. Now I know what you're thinking, what kind of moron would just send back the actual word in the JSON? Well, fortunately we end up hiding that stuff away in the word struct. We will have copies of this on the frontend, but it'll only ever contain the length of the word.
+
+```go
+type Word struct {
+	word         []rune
+	Length       int `json:"Length"`
+	letterCounts map[rune]int
+}
+```
+
+So we're good there at least. Now let's see how these are used when we create a game.
+
+```go
+func NewGame(options GameOptions) *Game {
+
+	word := options.Word
+	if len(options.Word) > 0 {
+		options.WordLength = len(options.Word)
+	} else {
+		word = randomWord(options.WordLength)
+	}
+	options.Word = ""
+	return &Game{
+		Id:          uuid.NewString(),
+		Word:        NewWord(word),
+		Guessed:     []*Guess{},
+		Winner:      false,
+		Options:     options,
+		Players:     util.NewSet(),
+		playersLock: sync.Mutex{},
+	}
+}
+```
+
+So in this, we refer to a randomWord function. This pulls from a list of 8000 of the most used, 5-8 letter words which are also valid scrabble words. And here's the python script I used to make that happen.
+
+```python
+scrabbleWords = set()
+with open("scrabble.txt") as scrabble:
+    for line in scrabble:
+        scrabbleWords.add(line.strip().lower())
+
+print(len(scrabbleWords))
+
+with open("unigram_freq.csv") as csv:
+    wordsraw = [line.strip().split(",") for line in csv]
+    wordsSorted = sorted(wordsraw, key=lambda x: int(x[1]), reverse=True)
+    words = [word[0] for word in wordsSorted]
+    fiveletter = [word for word in words if len(word) == 5 and word in scrabbleWords][:2000]
+    sixletter = [word for word in words if len(word) == 6 and word in scrabbleWords][:2000]
+    sevenletter = [word for word in words if len(word) == 7 and word in scrabbleWords][:2000]
+    eightletter = [word for word in words if len(word) == 8 and word in scrabbleWords][:2000]
+    f = open("fivewords.txt", "w")
+    for word in fiveletter:
+        f.write(word + "\n")
+    f.close()
+    f = open("sixwords.txt", "w")
+    for word in sixletter:
+        f.write(word + "\n")
+    f.close()
+    f = open("sevenwords.txt", "w")
+    for word in sevenletter:
+        f.write(word + "\n")
+    f.close()
+    f = open("eightwords.txt", "w")
+    for word in eightletter:
+        f.write(word + "\n")
+    f.close()
+
+csv.close()
+```
+
+Gotta love python.
+
+Now back to what we were talking about. The wordle logic. So we set up our board, and kick off the game. From here, clients will use the following function to submit guesses.
+
+```go
+func (g *Game) Guess(word, player string) error {
+	word = strings.ToLower(word)
+	if g.IsCompleted() {
+		return errors.New("game is completed")
+	} else if len(word) != g.Word.Length {
+		return errors.New("invalid word length")
+	}
+	if len(g.Guessed) > 0 {
+		lastGuess := g.Guessed[len(g.Guessed)-1]
+		if lastGuess.Player == player && time.Now().Before(lastGuess.Timestamp.Add(g.Options.TurnLength)) {
+			return errors.New("You have to wait at least 30 seconds before stealing the opponent's turn")
+		}
+	}
+
+	result := g.Word.Check(word)
+	flag := true
+	for _, v := range result {
+		if v != 2 {
+			flag = false
+			break
+		}
+	}
+	g.Winner = flag
+	guess := NewGuess(word, result, player)
+	g.Guessed = append(g.Guessed, guess)
+	return nil
+}
+```
+
+In here, we do a little more validation, check the guess, and update the state. For the checking logic, we handle the result as an array of numbers, where 0 is a complete miss, 1 is a partial hit, and 2 is a hit in the correct location. We also include a time check in the logic, which means that each player will either have to wait for their turn, or wait 30 seconds to steal their opponent's guess. When the game is completed, the client will broadcast this to the other threads and close out the game.
+
+So that's pretty much how the backend handles games. Now let's look at the frontend.
+
+# Fun with WebAssembly???
+
+Yeah, this is where things get spicy. What's the point in building out a cool, maybe-overengineered messaging system if we just have to rewrite all the code for sending messages in TypeScript? Go is actually pretty easy to compile into wasm, and doing so will allow us to reuse a ton of structs and code without having to translate everything. So here are some of the main functions we're going to be turning into wasm.
+
+```go
+type Session struct {
+	conn   *TinyWebsocket
+	state  *wordle.Game
+	player string
+}
+
+func NewSession(conn *TinyWebsocket) *Session {
+	return &Session{
+		conn: conn,
+	}
+}
+func (s *Session) Start() {
+	go func() {
+		defer s.conn.Close()
+		println("Started session")
+
+		decoder := json.NewDecoder(s.conn)
+		for decoder.More() {
+			println("start decode")
+			var msg ws.Event
+			if err := decoder.Decode(&msg); err != nil {
+				if jsonErr, ok := err.(*json.SyntaxError); ok {
+					problemPart := s.conn.allData[jsonErr.Offset-10 : jsonErr.Offset+10]
+					println(string(s.conn.allData))
+					err = fmt.Errorf("%w ~ error near '%s' (offset %d)", err, problemPart, jsonErr.Offset)
+				}
+				println("error parsing message as JSON:", err.Error())
+				// println(string())
+				return
+			}
+
+			switch msg.Type {
+			case ws.ErrorEvent:
+				js.Global().Get("OnGameError").Invoke(msg.Error.Details)
+			case ws.UpdateEvent:
+				if msg.PlayerID != s.player {
+					s.player = msg.PlayerID
+					js.Global().Get("OnPlayerID").Invoke(msg.PlayerID)
+				}
+				s.state = msg.State
+				js.Global().Get("OnGameState").Invoke(SlowJSValue(msg.State))
+			}
+		}
+		println("Stopped session")
+	}()
+}
+```
+
+So here we can see the main structs we're defining, as well as the `Start()` function we'll be using on the frontend to establish a connection to the backend, subscribe to our events, and wait for updates. As we can see, this allows us to natively interact with our messaging system, and reuse a ton of structs from the backend. Besides that, the start method is mostly a ton of error handling and setup/cleanup logic. When we get to the guessing however...
+
+```go
+func submitGuess(_ js.Value, args []js.Value) interface{} {
+	// start a new goroutine to stream objects from the server
+	go func() {
+		if session == nil {
+			println("no session to write guess")
+			return
+		}
+
+		session.Guess(args[0].String())
+	}()
+
+	return nil
+}
+
+func (s *Session) Guess(str string) {
+	guess := ws.GuessRequest{
+		Guess:  str,
+		Player: s.player,
+	}
+	enc, e := json.Marshal(guess)
+	if e != nil {
+		js.Global().Get("OnGameError").Invoke(e.Error())
+		return
+	}
+	_, e = s.conn.Write(enc)
+	if e != nil {
+		js.Global().Get("OnGameError").Invoke(e.Error())
+		return
+	}
+}
+```
+
+As we can see, the go-to-wasm pipeline really chops down on the amount of code needed to implement this. Not only that, but we can even publish our guesses straight to our channels and really milk that beautiful pub-sub goodness for all it's worth.
+
+But now, I know what you're thinking. How hard is it to get this all running? Do you need to sacrifice your first born child to the web dev gods or something? No, actually. You just need to copy a bunch of code and hook it into your build script. Then you too can enjoy the wonders of frontend go.
+
+So here's the step by step:
+
+### Step 1 (Optional)
+
+add these comments at top of your go files to specify which compile targets it builds for
+
+```go
+//go:build js && wasm
+```
+
+### Step 2
+
+assign your functions to global scope, like so:
+
+```go
+func main() {
+	js.Global().Set("NewGame", js.FuncOf(newGame))
+	js.Global().Set("JoinGame", js.FuncOf(joinGame))
+	js.Global().Set("JoinMatchmaking", js.FuncOf(joinMatchmaking))
+	js.Global().Set("SubmitGuess", js.FuncOf(submitGuess))
+	println("Game runtime loaded")
+
+	// Wait forever
+	select {}
+}
+```
+
+### Step 3
+
+Add this to your package.json:
+
+```json
+    "start": "npm run build-wasm && react-scripts start",
+    "build": "npm run build-wasm && react-scripts build",
+    "build-wasm": "cp $(go env GOROOT)/misc/wasm/wasm_exec.js public && GOOS=js GOARCH=wasm go build -ldflags=\"-s -w\" -o public/main.wasm ../cmd/web",
+```
+
+build-wasm will copy the wasm-exec into your public file and then compile your go into wasm. The wasm-exec file comes with new versions of go and provides a common API to make your compiled go code play nice with javascript.
+
+### Step 4
+
+Slap this into your index.html:
+
+```html
+<script src="%PUBLIC_URL%/wasm_exec.js"></script>
+```
+
+This will pull in that exec file we copied over in the previous step, and get everything ready for the wasm.
+
+### Step 5
+
+Include this shit in your app to run on pageload. It doesn't need to be in componentDidMount(), just needs to run once when your app starts.
+
+```typescript
+componentDidMount() {
+
+	// polyfill
+	if (!WebAssembly.instantiateStreaming) {
+		WebAssembly.instantiateStreaming = async (resp, importObject) => {
+			const source = await (await resp).arrayBuffer()
+			return await WebAssembly.instantiate(source, importObject)
+		}
+	}
+
+	const go: any = new Go()
+	WebAssembly.instantiateStreaming(fetch("/main.wasm"), go.importObject).then(
+		(result) => {
+			go.run(result.instance)
+			window.wasm = result.instance as any
+			this.setState({ wasmInit: true })
+		}
+	)
+}
+```
+
+This will kick off the wasm, and now we're able to call all those functions we defined earlier directly from our app.
+
+# Absolutely No Fun with React+Redux
+
+I kinda hate react and redux, and there are a million guides out there that do a way better job explaining it than I can. So I'm just gonna skip this part. Check out the source code if you really want to see how it works, or just roast me in the comments for being lazy.
+
+---
+
+## So in a nutshell, that's how you make a wordle clone.
+
+[Click here](https://github.com/Schnides123/wordle-vs) for the full source code. And if anyone actually reads this, I'll do a follow up post on the matchmaking or something. ✌️
+
+---
