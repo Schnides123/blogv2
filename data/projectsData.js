@@ -6,6 +6,7 @@ const projectsData = [
     for.`,
     imgSrc: '/static/images/google.png',
     href: 'https://www.google.com',
+    timestamp: '2022-02-11T00:00:01.000Z',
   },
   {
     title: 'The Time Machine',
@@ -14,6 +15,7 @@ const projectsData = [
     forgotten headphones with this simple yet affordable solution.`,
     imgSrc: '/static/images/time-machine.jpg',
     href: '/blog/the-time-machine',
+    timestamp: '2022-02-11T00:00:00.000Z',
   },
 ]
 

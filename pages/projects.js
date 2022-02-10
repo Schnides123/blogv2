@@ -3,6 +3,10 @@ import projectsData from '@/data/projectsData'
 import Card from '@/components/Card'
 import { PageSEO } from '@/components/SEO'
 
+const instagramData = require('@/data/instagramData.json')
+
+console.log(projectsData.sort((a, b) => a.timestamp - b.timestamp))
+
 export default function Projects() {
   return (
     <>
