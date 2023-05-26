@@ -19,7 +19,7 @@ const InstagramCard = ({ url }) => {
         className={`h-full overflow-hidden rounded-md border-2 border-gray-200 border-opacity-60 dark:border-gray-700`}
       >
         <InstagramEmbed
-          url={'https://instagr.am/p/' + url}
+          url={'https://instagram.com/p/' + url}
           width={width}
           caption={false}
           containerTagName="div"
